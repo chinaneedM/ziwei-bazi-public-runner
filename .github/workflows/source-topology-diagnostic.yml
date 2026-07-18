@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
           lfs: true
 
-      - name: Compute content-addressed candidate statuses
+      - name: Scan matching S19 filenames by content address
         shell: bash
         run: |
           set -euo pipefail
@@ -34,41 +34,36 @@ jobs:
           from pathlib import Path
 
           root = Path('private-authority')
-          manifest_path = root / 'knowledge/releases/KNOWLEDGE-R17/release-manifest.json'
-          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          manifest = json.loads((root / 'knowledge/releases/KNOWLEDGE-R17/release-manifest.json').read_text(encoding='utf-8'))
           row = next(item for item in manifest['source_files'] if item['library_id'] == 'S19')
-          candidates = [
-              row['repository_relative_path'],
-              f"knowledge/base/{row['canonical_filename']}",
-              f"knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE-V2/materialized/{row['canonical_filename']}",
-              f"knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE/materialized/{row['canonical_filename']}",
-          ]
+          matches = []
+          for path in root.rglob(row['canonical_filename']):
+              if not path.is_file():
+                  continue
+              size = path.stat().st_size
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              matches.append({
+                  'path': str(path.relative_to(root)),
+                  'size_bytes': size,
+                  'sha256': digest,
+                  'exact_match': size == row['file_size_bytes'] and digest == row['sha256_raw_file_bytes'],
+              })
           result = {
-              'schema': 'S19-CONTENT-ADDRESS-DIAGNOSTIC-V1',
+              'schema': 'S19-FILENAME-CONTENT-SCAN-V1',
               'expected_sha256': row['sha256_raw_file_bytes'],
               'expected_size_bytes': row['file_size_bytes'],
               'canonical_filename': row['canonical_filename'],
-              'candidates': [],
+              'matches': sorted(matches, key=lambda item: item['path']),
               'contains_source_content': False,
               'contains_answer_data': False,
+              'engineering_mode_only': True,
           }
-          for relative in dict.fromkeys(candidates):
-              path = root / relative
-              item = {'path': relative, 'exists': path.is_file()}
-              if path.is_file():
-                  item['size_bytes'] = path.stat().st_size
-                  item['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
-                  item['exact_match'] = (
-                      item['size_bytes'] == row['file_size_bytes']
-                      and item['sha256'] == row['sha256_raw_file_bytes']
-                  )
-              result['candidates'].append(item)
           Path('/tmp/s19-content-address-diagnostic.json').write_text(
               json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
           )
           print(json.dumps({
-              'candidate_count': len(result['candidates']),
-              'exact_match_count': sum(1 for item in result['candidates'] if item.get('exact_match')),
+              'filename_match_count': len(matches),
+              'exact_match_count': sum(1 for item in matches if item['exact_match']),
           }, sort_keys=True))
           PY
 
