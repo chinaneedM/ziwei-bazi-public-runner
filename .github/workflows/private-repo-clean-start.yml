@@ -1,0 +1,126 @@
+name: private-repo-clean-start
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'clean-start-requests/*.json'
+
+permissions:
+  contents: read
+
+jobs:
+  clean-start:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: request-head
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate one clean-start request
+        id: request
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          cd request-head
+          mapfile -t changed < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          [[ "${#changed[@]}" -eq 1 ]]
+          request="${changed[0]}"; case "$request" in clean-start-requests/*.json) ;; *) exit 1 ;; esac
+          python - "$request" <<'PY'
+          import json,re,sys
+          from pathlib import Path
+          b=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+          expected={'schema':'FORTUNE-PUBLIC-CLEAN-START-REQUEST-V1','status':'REQUESTED','task':'CREATE_CLEAN_START','private_repository':'chinaneedM/ziwei-bazi-model','answer_data_available':False}
+          for k,v in expected.items():
+              if b.get(k)!=v: raise SystemExit(k)
+          if not re.fullmatch(r'runtime/clean-start-requests/[A-Za-z0-9._-]+\.json',b.get('private_request_path','')): raise SystemExit('path')
+          if not re.fullmatch(r'GROUP-RUN-[A-Za-z0-9._-]+',b.get('group_run_id','')): raise SystemExit('run')
+          if not re.fullmatch(r'[0-9a-f]{64}',b.get('private_request_sha256','')): raise SystemExit('digest')
+          PY
+          echo "path=$request" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: chinaneedM/ziwei-bazi-model
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private-authority
+          fetch-depth: 1
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify binding and create clean start
+        env:
+          REQUEST_PATH: ${{ steps.request.outputs.path }}
+        run: |
+          set -euo pipefail
+          python - "$REQUEST_PATH" <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          pub=json.loads((Path('request-head')/sys.argv[1]).read_text(encoding='utf-8'))
+          private=Path('private-authority')/pub['private_request_path']
+          if hashlib.sha256(private.read_bytes()).hexdigest()!=pub['private_request_sha256']: raise SystemExit('request digest')
+          body=json.loads(private.read_text(encoding='utf-8'))
+          if body.get('group_run_id')!=pub['group_run_id']: raise SystemExit('group run')
+          if body.get('answer_vault_physical_access_test_status')!='PASS_INACCESSIBLE': raise SystemExit('answer vault gate')
+          Path('/tmp/private-request.txt').write_text(pub['private_request_path'])
+          Path('/tmp/group-run.txt').write_text(pub['group_run_id'])
+          PY
+          cd private-authority
+          PYTHONPATH=src python scripts/create-group-clean-start.py create-from-request \
+            --request "$(cat /tmp/private-request.txt)" \
+            --current-group-manifest CURRENT_GROUP_MANIFEST \
+            > /tmp/clean-start-result.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('/tmp/clean-start-result.json').read_text(encoding='utf-8'))
+          if r.get('status')!='READY_FOR_CLEAN_GROUP_PREDICTION' or r.get('answer_data_available') is not False: raise SystemExit('clean-start result')
+          expected=Path('data/group-clean-starts')/r['group_run_id']/'clean-start.json'
+          if Path(r['clean_start_path'])!=expected or not expected.is_file(): raise SystemExit('clean-start path')
+          print(json.dumps({'status':r['status'],'group_run_id':r['group_run_id'],'case_count':r['case_count'],'answer_data_available':r['answer_data_available']},sort_keys=True))
+          PY
+
+      - name: Commit and push private clean-start audit branch
+        run: |
+          set -euo pipefail
+          cd private-authority
+          group_run="$(cat /tmp/group-run.txt)"
+          output_root="data/group-clean-starts/${group_run}"
+          branch="public-executor/${group_run}-clean-start-${GITHUB_RUN_ID}"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -f -- "$output_root"
+          python - "$output_root" <<'PY'
+          import subprocess,sys
+          root=sys.argv[1]
+          paths=[x.decode('utf-8') for x in subprocess.check_output(['git','diff','--cached','--name-only','-z']).split(b'\0') if x]
+          if not paths: raise SystemExit('no staged files')
+          for path in paths:
+              if not path.startswith(root+'/'): raise SystemExit('out-of-scope: '+path)
+          print('validated staged files:',len(paths))
+          PY
+          git commit -m "Materialize clean start for ${group_run}"
+          git push origin "HEAD:refs/heads/${branch}"
+          commit="$(git rev-parse HEAD)"
+          printf '{"schema":"CLEAN-START-WRITEBACK-RECEIPT-V1","status":"PASS","branch":"%s","commit_sha":"%s","group_run_id":"%s","contains_answer_data":false}\n' "$branch" "$commit" "$group_run" > /tmp/clean-start-writeback-receipt.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clean-start-writeback-receipt-${{ github.run_id }}
+          path: /tmp/clean-start-writeback-receipt.json
+          retention-days: 1
