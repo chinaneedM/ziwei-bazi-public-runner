@@ -63,37 +63,109 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Verify binding and create clean start
+      - name: Verify private clean-start binding
+        id: binding
+        continue-on-error: true
         env:
           REQUEST_PATH: ${{ steps.request.outputs.path }}
         run: |
-          set -euo pipefail
-          python - "$REQUEST_PATH" <<'PY'
+          set +e
+          python - "$REQUEST_PATH" > /tmp/binding-out.log 2> /tmp/binding-error.log <<'PY'
           import hashlib,json,sys
           from pathlib import Path
           pub=json.loads((Path('request-head')/sys.argv[1]).read_text(encoding='utf-8'))
           private=Path('private-authority')/pub['private_request_path']
-          if hashlib.sha256(private.read_bytes()).hexdigest()!=pub['private_request_sha256']: raise SystemExit('request digest')
+          actual=hashlib.sha256(private.read_bytes()).hexdigest()
+          if actual!=pub['private_request_sha256']:
+              raise SystemExit(f'request digest mismatch expected={pub["private_request_sha256"]} actual={actual}')
           body=json.loads(private.read_text(encoding='utf-8'))
-          if body.get('group_run_id')!=pub['group_run_id']: raise SystemExit('group run')
+          if body.get('group_run_id')!=pub['group_run_id']: raise SystemExit('group run mismatch')
           if body.get('answer_vault_physical_access_test_status')!='PASS_INACCESSIBLE': raise SystemExit('answer vault gate')
           Path('/tmp/private-request.txt').write_text(pub['private_request_path'])
           Path('/tmp/group-run.txt').write_text(pub['group_run_id'])
+          print('PASS')
           PY
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Execute private clean-start builder
+        id: builder
+        if: steps.binding.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
           cd private-authority
           PYTHONPATH=src python scripts/create-group-clean-start.py create-from-request \
             --request "$(cat /tmp/private-request.txt)" \
             --current-group-manifest CURRENT_GROUP_MANIFEST \
-            > /tmp/clean-start-result.json
-          python - <<'PY'
+            > /tmp/clean-start-result.json 2> /tmp/clean-start-builder-error.log
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Validate clean-start result
+        id: result
+        if: steps.binding.outcome == 'success' && steps.builder.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          cd private-authority
+          python - > /tmp/result-out.log 2> /tmp/clean-start-result-error.log <<'PY'
           import json
           from pathlib import Path
           r=json.loads(Path('/tmp/clean-start-result.json').read_text(encoding='utf-8'))
-          if r.get('status')!='READY_FOR_CLEAN_GROUP_PREDICTION' or r.get('answer_data_available') is not False: raise SystemExit('clean-start result')
+          if r.get('status')!='READY_FOR_CLEAN_GROUP_PREDICTION' or r.get('answer_data_available') is not False: raise SystemExit('clean-start status')
           expected=Path('data/group-clean-starts')/r['group_run_id']/'clean-start.json'
           if Path(r['clean_start_path'])!=expected or not expected.is_file(): raise SystemExit('clean-start path')
-          print(json.dumps({'status':r['status'],'group_run_id':r['group_run_id'],'case_count':r['case_count'],'answer_data_available':r['answer_data_available']},sort_keys=True))
+          print(json.dumps({'status':r['status'],'group_run_id':r['group_run_id'],'case_count':len(r.get('cases',[])),'answer_data_available':r['answer_data_available']},sort_keys=True))
           PY
+          status=$?
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Create sanitized clean-start diagnostic
+        if: steps.binding.outcome == 'failure' || steps.builder.outcome == 'failure' || steps.result.outcome == 'failure'
+        run: |
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          stages=[
+              ('REQUEST_BINDING','/tmp/binding-error.log','${{ steps.binding.outcome }}','${{ steps.binding.outputs.exit_code }}'),
+              ('SCRIPT_EXECUTION','/tmp/clean-start-builder-error.log','${{ steps.builder.outcome }}','${{ steps.builder.outputs.exit_code }}'),
+              ('RESULT_VALIDATION','/tmp/clean-start-result-error.log','${{ steps.result.outcome }}','${{ steps.result.outputs.exit_code }}'),
+          ]
+          failed=next((x for x in stages if x[2]=='failure'),('UNKNOWN','', 'failure',''))
+          path=Path(failed[1]) if failed[1] else None
+          lines=path.read_text(encoding='utf-8',errors='replace').splitlines()[-30:] if path and path.exists() else []
+          safe=[]
+          for line in lines:
+              line=re.sub(r'/home/runner/[^ ]+','<RUNNER_PATH>',line)
+              line=re.sub(r'gh[pousr]_[A-Za-z0-9_]+','<REDACTED_TOKEN>',line)
+              safe.append(line[:500])
+          result_keys=[]; result_status=None
+          rp=Path('/tmp/clean-start-result.json')
+          if rp.exists():
+              try:
+                  obj=json.loads(rp.read_text(encoding='utf-8'))
+                  result_keys=sorted(obj.keys()); result_status=obj.get('status')
+              except Exception:
+                  pass
+          body={'schema':'CLEAN-START-SANITIZED-DIAGNOSTIC-V1','failed_stage':failed[0],'exit_code':int(failed[3] or 1),'stderr_tail':safe,'result_top_level_keys':result_keys,'result_status':result_status,'contains_case_content':False,'contains_answer_data':False}
+          Path('/tmp/clean-start-diagnostic.json').write_text(json.dumps(body,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          PY
+
+      - name: Upload sanitized clean-start diagnostic
+        if: steps.binding.outcome == 'failure' || steps.builder.outcome == 'failure' || steps.result.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-start-diagnostic-${{ github.run_id }}
+          path: /tmp/clean-start-diagnostic.json
+          retention-days: 1
+
+      - name: Stop after clean-start failure
+        if: steps.binding.outcome == 'failure' || steps.builder.outcome == 'failure' || steps.result.outcome == 'failure'
+        run: exit 1
 
       - name: Commit and push private clean-start audit branch
         run: |
