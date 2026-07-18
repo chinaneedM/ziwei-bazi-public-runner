@@ -1,0 +1,10 @@
+{
+  "answer_data_available": false,
+  "group_run_id": "GROUP-RUN-20260718T180018Z-1F09939E2A6A",
+  "private_repository": "chinaneedM/ziwei-bazi-model",
+  "private_request_path": "runtime/runtime-packet-requests/GROUP-RUN-20260718T180018Z-1F09939E2A6A.json",
+  "private_request_sha256": "937f14a910a90a9e78d45410e240d99893e78a8fff3cd321d02179e4fa1ee955",
+  "schema": "FORTUNE-PUBLIC-EXECUTOR-REQUEST-V1",
+  "status": "REQUESTED",
+  "task": "BUILD_RUNTIME_PACKETS"
+}
