@@ -43,46 +43,36 @@ jobs:
           set -euo pipefail
           cd request-revision
           mapfile -t changed < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-          if [[ "${#changed[@]}" -ne 1 ]]; then
-            echo "exactly one changed request file is required" >&2
-            exit 1
-          fi
+          [[ "${#changed[@]}" -eq 1 ]]
           request="${changed[0]}"
-          case "$request" in
-            requests/*.json) ;;
-            *) echo "changed file is outside requests/: $request" >&2; exit 1 ;;
-          esac
+          case "$request" in requests/*.json) ;; *) exit 1 ;; esac
           python - "$request" <<'PY'
           import json, re, sys
           from pathlib import Path
           body = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-          required = {
+          expected = {
               'schema': 'FORTUNE-PUBLIC-EXECUTOR-REQUEST-V1',
               'status': 'REQUESTED',
               'task': 'BUILD_RUNTIME_PACKETS',
               'private_repository': 'chinaneedM/ziwei-bazi-model',
               'answer_data_available': False,
           }
-          for key, expected in required.items():
-              if body.get(key) != expected:
+          for key, value in expected.items():
+              if body.get(key) != value:
                   raise SystemExit(f'invalid {key}')
           if not re.fullmatch(r'runtime/runtime-packet-requests/[A-Za-z0-9._-]+\.json', body.get('private_request_path', '')):
-              raise SystemExit('invalid private_request_path')
+              raise SystemExit('invalid private request path')
           if not re.fullmatch(r'GROUP-RUN-[A-Za-z0-9._-]+', body.get('group_run_id', '')):
-              raise SystemExit('invalid group_run_id')
+              raise SystemExit('invalid group run id')
           if not re.fullmatch(r'[0-9a-f]{64}', body.get('private_request_sha256', '')):
-              raise SystemExit('invalid private_request_sha256')
-          print('request validation PASS')
+              raise SystemExit('invalid private request digest')
           PY
           echo "request_path=$request" >> "$GITHUB_OUTPUT"
 
       - name: Require private repository credential
-        shell: bash
         env:
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -n "$PRIVATE_REPO_TOKEN"
+        run: test -n "$PRIVATE_REPO_TOKEN"
 
       - name: Checkout private authority repository
         uses: actions/checkout@v4
@@ -100,7 +90,6 @@ jobs:
           python-version: '3.11'
 
       - name: Verify private request binding
-        shell: bash
         env:
           PUBLIC_REQUEST_PATH: ${{ steps.request.outputs.request_path }}
         run: |
@@ -109,21 +98,15 @@ jobs:
           import hashlib, json, sys
           from pathlib import Path
           public = json.loads((Path('request-revision') / sys.argv[1]).read_text(encoding='utf-8'))
-          private_path = Path('private-authority') / public['private_request_path']
-          if not private_path.is_file():
-              raise SystemExit('private request missing')
-          if hashlib.sha256(private_path.read_bytes()).hexdigest() != public['private_request_sha256']:
-              raise SystemExit('private request hash mismatch')
-          private = json.loads(private_path.read_text(encoding='utf-8'))
-          if private.get('group_run_id') != public['group_run_id']:
-              raise SystemExit('group run mismatch')
-          if private.get('answer_data_available') is not False:
-              raise SystemExit('answer data gate failed')
-          print('private request binding PASS')
+          path = Path('private-authority') / public['private_request_path']
+          if hashlib.sha256(path.read_bytes()).hexdigest() != public['private_request_sha256']:
+              raise SystemExit('private request digest mismatch')
+          private = json.loads(path.read_text(encoding='utf-8'))
+          if private.get('group_run_id') != public['group_run_id'] or private.get('answer_data_available') is not False:
+              raise SystemExit('private request binding failed')
           PY
 
-      - name: Materialize verified private source aliases
-        shell: bash
+      - name: Materialize content-addressed release sources
         env:
           PUBLIC_REQUEST_PATH: ${{ steps.request.outputs.request_path }}
         run: |
@@ -134,36 +117,78 @@ jobs:
 
           root = Path('private-authority')
           public = json.loads((Path('request-revision') / sys.argv[1]).read_text(encoding='utf-8'))
-          private_request = json.loads((root / public['private_request_path']).read_text(encoding='utf-8'))
-          manifest = json.loads((root / private_request['knowledge_manifest_path']).read_text(encoding='utf-8'))
-          aliases = []
+          request = json.loads((root / public['private_request_path']).read_text(encoding='utf-8'))
+          manifest = json.loads((root / request['knowledge_manifest_path']).read_text(encoding='utf-8'))
+          materialized = []
+
           for row in manifest['source_files']:
               expected = root / row['repository_relative_path']
               if expected.is_file():
+                  data = expected.read_bytes()
+                  if len(data) != row['file_size_bytes'] or hashlib.sha256(data).hexdigest() != row['sha256_raw_file_bytes']:
+                      raise SystemExit(f"existing source mismatch: {row['library_id']}")
                   continue
-              fallback = root / 'knowledge' / 'base' / row['canonical_filename']
-              if not fallback.is_file():
-                  raise SystemExit(f"missing source and canonical fallback: {row['library_id']}")
-              size = fallback.stat().st_size
-              digest = hashlib.sha256(fallback.read_bytes()).hexdigest()
-              if size != row['file_size_bytes']:
-                  raise SystemExit(f"canonical fallback size mismatch: {row['library_id']}")
-              if digest != row['sha256_raw_file_bytes']:
-                  raise SystemExit(f"canonical fallback sha mismatch: {row['library_id']}")
+
+              base = root / 'knowledge' / 'base' / row['canonical_filename']
+              if not base.is_file():
+                  raise SystemExit(f"canonical base missing: {row['library_id']}")
+
+              if row['library_id'] == 'S19':
+                  overlay = root / 'knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE/S19-R17-control-root-overlay.txt'
+                  if not overlay.is_file():
+                      raise SystemExit('R17 S19 overlay missing')
+                  o = overlay.read_bytes()
+                  b = base.read_bytes()
+                  variants = {
+                      'OVERLAY_PLUS_BASE': o + b,
+                      'OVERLAY_TRIM_LF_PLUS_LF_PLUS_BASE': o.rstrip(b'\n') + b'\n' + b,
+                      'OVERLAY_PLUS_BASE_LSTRIP_LF': o + b.lstrip(b'\n'),
+                      'SINGLE_LF_BOUNDARY': o.rstrip(b'\r\n') + b'\n' + b.lstrip(b'\r\n'),
+                      'DOUBLE_LF_BOUNDARY': o.rstrip(b'\r\n') + b'\n\n' + b.lstrip(b'\r\n'),
+                  }
+                  exact = [
+                      (name, data) for name, data in variants.items()
+                      if len(data) == row['file_size_bytes']
+                      and hashlib.sha256(data).hexdigest() == row['sha256_raw_file_bytes']
+                  ]
+                  if len(exact) != 1:
+                      summary = {
+                          name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+                          for name, data in variants.items()
+                      }
+                      Path('/tmp/runtime-packet-diagnostic.json').write_text(json.dumps({
+                          'schema': 'R17-S19-COMPOSITE-DIAGNOSTIC-V1',
+                          'expected_size': row['file_size_bytes'],
+                          'expected_sha256': row['sha256_raw_file_bytes'],
+                          'variants': summary,
+                          'contains_source_content': False,
+                          'contains_answer_data': False,
+                      }, indent=2) + '\n', encoding='utf-8')
+                      raise SystemExit('no unique exact R17 S19 composite')
+                  mode, data = exact[0]
+              else:
+                  data = base.read_bytes()
+                  mode = 'CANONICAL_BASE_ALIAS'
+                  if len(data) != row['file_size_bytes'] or hashlib.sha256(data).hexdigest() != row['sha256_raw_file_bytes']:
+                      raise SystemExit(f"canonical base mismatch: {row['library_id']}")
+
               expected.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copyfile(fallback, expected)
-              aliases.append({
+              expected.write_bytes(data)
+              materialized.append({
                   'library_id': row['library_id'],
                   'path': row['repository_relative_path'],
-                  'sha256': digest,
-                  'size_bytes': size,
+                  'mode': mode,
+                  'size_bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
               })
-          Path('/tmp/source-aliases.json').write_text(json.dumps(aliases, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-          print(json.dumps({'verified_alias_count': len(aliases), 'library_ids': [row['library_id'] for row in aliases]}, sort_keys=True))
+
+          Path('/tmp/source-materializations.json').write_text(
+              json.dumps(materialized, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+          )
+          print(json.dumps({'materialized_count': len(materialized), 'library_ids': [x['library_id'] for x in materialized]}, sort_keys=True))
           PY
 
-      - name: Build answer-free runtime packets in private checkout
-        shell: bash
+      - name: Build and verify answer-free runtime packets
         env:
           PUBLIC_REQUEST_PATH: ${{ steps.request.outputs.request_path }}
         run: |
@@ -171,29 +196,21 @@ jobs:
           private_request="$(python - "$PUBLIC_REQUEST_PATH" <<'PY'
           import json, sys
           from pathlib import Path
-          body = json.loads((Path('request-revision') / sys.argv[1]).read_text(encoding='utf-8'))
-          print(body['private_request_path'])
+          print(json.loads((Path('request-revision') / sys.argv[1]).read_text(encoding='utf-8'))['private_request_path'])
           PY
           )"
           cd private-authority
           set +e
-          python scripts/create-group-runtime-packets.py \
-            --request "$private_request" \
-            --max-per-question 8 \
-            > /tmp/runtime-packet-result.json \
-            2> /tmp/runtime-packet-error.log
-          build_status=$?
+          python scripts/create-group-runtime-packets.py --request "$private_request" --max-per-question 8 \
+            > /tmp/runtime-packet-result.json 2> /tmp/runtime-packet-error.log
+          status=$?
           set -e
-          if [[ "$build_status" -ne 0 ]]; then
-            python - "$build_status" <<'PY'
+          if [[ "$status" -ne 0 ]]; then
+            python - "$status" <<'PY'
           import json, re, sys
           from pathlib import Path
           lines = Path('/tmp/runtime-packet-error.log').read_text(encoding='utf-8', errors='replace').splitlines()[-30:]
-          safe = []
-          for line in lines:
-              line = re.sub(r'/home/runner/[^ ]+', '<RUNNER_PATH>', line)
-              line = re.sub(r'gh[pousr]_[A-Za-z0-9_]+', '<REDACTED_TOKEN>', line)
-              safe.append(line[:500])
+          safe = [re.sub(r'/home/runner/[^ ]+', '<RUNNER_PATH>', line)[:500] for line in lines]
           Path('/tmp/runtime-packet-diagnostic.json').write_text(json.dumps({
               'schema': 'PUBLIC-RUNNER-SANITIZED-DIAGNOSTIC-V1',
               'exit_code': int(sys.argv[1]),
@@ -202,30 +219,27 @@ jobs:
               'contains_answer_data': False,
           }, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           PY
-            exit "$build_status"
+            exit "$status"
           fi
           python - <<'PY'
           import json
           from pathlib import Path
           result = json.loads(Path('/tmp/runtime-packet-result.json').read_text(encoding='utf-8'))
-          if result.get('status') != 'READY_FOR_BLIND_PREDICTION':
-              raise SystemExit('packet build status failed')
-          if result.get('answer_data_available') is not False:
-              raise SystemExit('answer isolation failed')
-          transport = Path(result['transport_plan_path'])
-          body = json.loads(transport.read_text(encoding='utf-8'))
-          if body.get('status') != 'READY' or body.get('answer_data_available') is not False:
-              raise SystemExit('transport plan validation failed')
+          if result.get('status') != 'READY_FOR_BLIND_PREDICTION' or result.get('answer_data_available') is not False:
+              raise SystemExit('runtime packet result failed')
+          transport = json.loads(Path(result['transport_plan_path']).read_text(encoding='utf-8'))
+          if transport.get('status') != 'READY' or transport.get('answer_data_available') is not False:
+              raise SystemExit('transport plan failed')
           print(json.dumps({
               'status': result['status'],
               'group_run_id': result['group_run_id'],
               'case_count': result['case_count'],
               'generated_path_count': result['generated_path_count'],
               'source_packet_item_counts': result['source_packet_item_counts'],
-          }, ensure_ascii=False, sort_keys=True))
+          }, sort_keys=True))
           PY
 
-      - name: Upload sanitized build diagnostic
+      - name: Upload sanitized diagnostic
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -234,9 +248,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-      - name: Commit bound aliases and private output root
+      - name: Commit repaired sources and bound runtime output
         if: success()
-        shell: bash
         env:
           PUBLIC_REQUEST_PATH: ${{ steps.request.outputs.request_path }}
         run: |
@@ -244,42 +257,29 @@ jobs:
           group_run_id="$(python - "$PUBLIC_REQUEST_PATH" <<'PY'
           import json, sys
           from pathlib import Path
-          body = json.loads((Path('request-revision') / sys.argv[1]).read_text(encoding='utf-8'))
-          print(body['group_run_id'])
+          print(json.loads((Path('request-revision') / sys.argv[1]).read_text(encoding='utf-8'))['group_run_id'])
           PY
           )"
           cd private-authority
           output_root="data/group-clean-starts/${group_run_id}"
-          test -d "$output_root"
-          mapfile -t alias_paths < <(python - <<'PY'
+          mapfile -t source_paths < <(python - <<'PY'
           import json
           from pathlib import Path
-          for row in json.loads(Path('/tmp/source-aliases.json').read_text(encoding='utf-8')):
+          for row in json.loads(Path('/tmp/source-materializations.json').read_text(encoding='utf-8')):
               print(row['path'])
           PY
           )
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -- "$output_root"
-          for alias in "${alias_paths[@]}"; do
-            git add -- "$alias"
-          done
+          for path in "${source_paths[@]}"; do git add -- "$path"; done
           mapfile -t staged < <(git diff --cached --name-only)
-          test "${#staged[@]}" -gt 0
+          [[ "${#staged[@]}" -gt 0 ]]
           for path in "${staged[@]}"; do
             allowed=false
-            case "$path" in
-              "$output_root"/*) allowed=true ;;
-            esac
-            for alias in "${alias_paths[@]}"; do
-              if [[ "$path" == "$alias" ]]; then
-                allowed=true
-              fi
-            done
-            if [[ "$allowed" != true ]]; then
-              echo "out-of-scope staged path: $path" >&2
-              exit 1
-            fi
+            case "$path" in "$output_root"/*) allowed=true ;; esac
+            for source in "${source_paths[@]}"; do [[ "$path" == "$source" ]] && allowed=true; done
+            [[ "$allowed" == true ]]
           done
-          git commit -m "Repair source topology and materialize runtime packets for ${group_run_id}"
+          git commit -m "Restore R17 S19 and materialize runtime packets for ${group_run_id}"
           git push origin HEAD:main
