@@ -122,6 +122,46 @@ jobs:
           print('private request binding PASS')
           PY
 
+      - name: Materialize verified private source aliases
+        shell: bash
+        env:
+          PUBLIC_REQUEST_PATH: ${{ steps.request.outputs.request_path }}
+        run: |
+          set -euo pipefail
+          python - "$PUBLIC_REQUEST_PATH" <<'PY'
+          import hashlib, json, shutil, sys
+          from pathlib import Path
+
+          root = Path('private-authority')
+          public = json.loads((Path('request-revision') / sys.argv[1]).read_text(encoding='utf-8'))
+          private_request = json.loads((root / public['private_request_path']).read_text(encoding='utf-8'))
+          manifest = json.loads((root / private_request['knowledge_manifest_path']).read_text(encoding='utf-8'))
+          aliases = []
+          for row in manifest['source_files']:
+              expected = root / row['repository_relative_path']
+              if expected.is_file():
+                  continue
+              fallback = root / 'knowledge' / 'base' / row['canonical_filename']
+              if not fallback.is_file():
+                  raise SystemExit(f"missing source and canonical fallback: {row['library_id']}")
+              size = fallback.stat().st_size
+              digest = hashlib.sha256(fallback.read_bytes()).hexdigest()
+              if size != row['file_size_bytes']:
+                  raise SystemExit(f"canonical fallback size mismatch: {row['library_id']}")
+              if digest != row['sha256_raw_file_bytes']:
+                  raise SystemExit(f"canonical fallback sha mismatch: {row['library_id']}")
+              expected.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(fallback, expected)
+              aliases.append({
+                  'library_id': row['library_id'],
+                  'path': row['repository_relative_path'],
+                  'sha256': digest,
+                  'size_bytes': size,
+              })
+          Path('/tmp/source-aliases.json').write_text(json.dumps(aliases, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps({'verified_alias_count': len(aliases), 'library_ids': [row['library_id'] for row in aliases]}, sort_keys=True))
+          PY
+
       - name: Build answer-free runtime packets in private checkout
         shell: bash
         env:
@@ -194,7 +234,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-      - name: Commit only bound private output root
+      - name: Commit bound aliases and private output root
         if: success()
         shell: bash
         env:
@@ -211,16 +251,35 @@ jobs:
           cd private-authority
           output_root="data/group-clean-starts/${group_run_id}"
           test -d "$output_root"
+          mapfile -t alias_paths < <(python - <<'PY'
+          import json
+          from pathlib import Path
+          for row in json.loads(Path('/tmp/source-aliases.json').read_text(encoding='utf-8')):
+              print(row['path'])
+          PY
+          )
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -- "$output_root"
+          for alias in "${alias_paths[@]}"; do
+            git add -- "$alias"
+          done
           mapfile -t staged < <(git diff --cached --name-only)
           test "${#staged[@]}" -gt 0
           for path in "${staged[@]}"; do
+            allowed=false
             case "$path" in
-              "$output_root"/*) ;;
-              *) echo "out-of-scope staged path: $path" >&2; exit 1 ;;
+              "$output_root"/*) allowed=true ;;
             esac
+            for alias in "${alias_paths[@]}"; do
+              if [[ "$path" == "$alias" ]]; then
+                allowed=true
+              fi
+            done
+            if [[ "$allowed" != true ]]; then
+              echo "out-of-scope staged path: $path" >&2
+              exit 1
+            fi
           done
-          git commit -m "Materialize answer-free runtime packets for ${group_run_id}"
+          git commit -m "Repair source topology and materialize runtime packets for ${group_run_id}"
           git push origin HEAD:main
