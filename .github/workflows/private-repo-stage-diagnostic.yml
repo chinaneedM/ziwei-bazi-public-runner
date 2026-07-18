@@ -1,0 +1,106 @@
+name: private-repo-stage-diagnostic
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'requests/*.json'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-stage:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: request-head
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/checkout@v4
+        with:
+          repository: chinaneedM/ziwei-bazi-model
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private-authority
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Rebuild verified objects
+        run: |
+          set -euo pipefail
+          request="request-head/requests/GROUP-RUN-20260718T180018Z-1F09939E2A6A.json"
+          python - "$request" <<'PY'
+          import hashlib,json,sys
+          from pathlib import Path
+          pub=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+          root=Path('private-authority'); req=root/pub['private_request_path']
+          if hashlib.sha256(req.read_bytes()).hexdigest()!=pub['private_request_sha256']: raise SystemExit('request digest')
+          body=json.loads(req.read_text(encoding='utf-8')); manifest=json.loads((root/body['knowledge_manifest_path']).read_text(encoding='utf-8'))
+          mats=[]
+          for row in manifest['source_files']:
+              target=root/row['repository_relative_path']
+              if target.is_file(): data=target.read_bytes()
+              else:
+                  base=(root/'knowledge/base'/row['canonical_filename']).read_bytes()
+                  if row['library_id']=='S19':
+                      overlay=(root/'knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE/S19-R17-control-root-overlay.txt').read_bytes(); data=overlay.rstrip(b'\n')+b'\n'+base
+                  else: data=base
+                  target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(data); mats.append(row['repository_relative_path'])
+              if len(data)!=row['file_size_bytes'] or hashlib.sha256(data).hexdigest()!=row['sha256_raw_file_bytes']: raise SystemExit(row['library_id'])
+          Path('/tmp/mats.json').write_text(json.dumps(mats,ensure_ascii=False)+'\n')
+          Path('/tmp/private-request.txt').write_text(pub['private_request_path'])
+          Path('/tmp/group-run.txt').write_text(pub['group_run_id'])
+          PY
+          cd private-authority
+          python scripts/create-group-runtime-packets.py --request "$(cat /tmp/private-request.txt)" --max-per-question 8 >/tmp/build-result.json
+
+      - name: Diagnose staging and commit
+        run: |
+          set +e
+          cd private-authority
+          group_run="$(cat /tmp/group-run.txt)"
+          output_root="data/group-clean-starts/${group_run}"
+          : >/tmp/stage-errors.log
+          git add -f -- "$output_root" 2>>/tmp/stage-errors.log
+          output_add_status=$?
+          source_add_status=0
+          while IFS= read -r path; do
+            git add -f -- "$path" 2>>/tmp/stage-errors.log || source_add_status=$?
+          done < <(python - <<'PY'
+          import json
+          from pathlib import Path
+          for x in json.loads(Path('/tmp/mats.json').read_text()): print(x)
+          PY
+          )
+          git diff --cached --name-only >/tmp/staged-paths.txt 2>>/tmp/stage-errors.log
+          staged_status=$?
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "Diagnostic commit ${group_run}" >/tmp/commit-output.log 2>>/tmp/stage-errors.log
+          commit_status=$?
+          python - "$output_add_status" "$source_add_status" "$staged_status" "$commit_status" <<'PY'
+          import json,re,sys
+          from pathlib import Path
+          paths=Path('/tmp/staged-paths.txt').read_text(encoding='utf-8',errors='replace').splitlines()
+          errors=Path('/tmp/stage-errors.log').read_text(encoding='utf-8',errors='replace').splitlines()[-40:]
+          errors=[re.sub(r'gh[pousr]_[A-Za-z0-9_]+','<REDACTED_TOKEN>',x)[:500] for x in errors]
+          body={'schema':'PRIVATE-STAGE-DIAGNOSTIC-V1','output_add_status':int(sys.argv[1]),'source_add_status':int(sys.argv[2]),'staged_list_status':int(sys.argv[3]),'commit_status':int(sys.argv[4]),'staged_paths':paths,'stderr_tail':errors,'contains_file_content':False,'contains_answer_data':False}
+          Path('/tmp/private-stage-diagnostic.json').write_text(json.dumps(body,ensure_ascii=False,indent=2)+'\n')
+          PY
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: private-stage-diagnostic-${{ github.run_id }}
+          path: /tmp/private-stage-diagnostic.json
+          retention-days: 1
