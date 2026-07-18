@@ -1,0 +1,186 @@
+name: private-repo-branch-writeback
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'requests/*.json'
+
+permissions:
+  contents: read
+
+jobs:
+  writeback:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout trusted public base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - name: Checkout request head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: request-head
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Validate request
+        id: request
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          cd request-head
+          mapfile -t changed < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          [[ "${#changed[@]}" -eq 1 ]]
+          request="${changed[0]}"
+          case "$request" in requests/*.json) ;; *) exit 1 ;; esac
+          python - "$request" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          b = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+          if b.get('schema') != 'FORTUNE-PUBLIC-EXECUTOR-REQUEST-V1': raise SystemExit('schema')
+          if b.get('status') != 'REQUESTED': raise SystemExit('status')
+          if b.get('task') != 'BUILD_RUNTIME_PACKETS': raise SystemExit('task')
+          if b.get('private_repository') != 'chinaneedM/ziwei-bazi-model': raise SystemExit('repo')
+          if b.get('answer_data_available') is not False: raise SystemExit('answer gate')
+          if not re.fullmatch(r'runtime/runtime-packet-requests/[A-Za-z0-9._-]+\.json', b.get('private_request_path','')): raise SystemExit('path')
+          if not re.fullmatch(r'GROUP-RUN-[A-Za-z0-9._-]+', b.get('group_run_id','')): raise SystemExit('run')
+          if not re.fullmatch(r'[0-9a-f]{64}', b.get('private_request_sha256','')): raise SystemExit('digest')
+          PY
+          echo "path=$request" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout private authority
+        uses: actions/checkout@v4
+        with:
+          repository: chinaneedM/ziwei-bazi-model
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private-authority
+          fetch-depth: 1
+          persist-credentials: true
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify binding and reconstruct R17 source
+        env:
+          REQUEST_PATH: ${{ steps.request.outputs.path }}
+        run: |
+          set -euo pipefail
+          python - "$REQUEST_PATH" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          public = json.loads((Path('request-head')/sys.argv[1]).read_text(encoding='utf-8'))
+          root = Path('private-authority')
+          private_path = root/public['private_request_path']
+          if hashlib.sha256(private_path.read_bytes()).hexdigest() != public['private_request_sha256']: raise SystemExit('request digest')
+          request = json.loads(private_path.read_text(encoding='utf-8'))
+          if request.get('group_run_id') != public['group_run_id'] or request.get('answer_data_available') is not False: raise SystemExit('binding')
+          manifest = json.loads((root/request['knowledge_manifest_path']).read_text(encoding='utf-8'))
+          materialized=[]
+          for row in manifest['source_files']:
+              target=root/row['repository_relative_path']
+              if target.is_file():
+                  data=target.read_bytes()
+                  if len(data)!=row['file_size_bytes'] or hashlib.sha256(data).hexdigest()!=row['sha256_raw_file_bytes']: raise SystemExit('existing source mismatch')
+                  continue
+              base=(root/'knowledge/base'/row['canonical_filename']).read_bytes()
+              if row['library_id']=='S19':
+                  overlay=(root/'knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE/S19-R17-control-root-overlay.txt').read_bytes()
+                  data=overlay.rstrip(b'\n')+b'\n'+base
+                  mode='R17_CONTROL_ROOT_PLUS_RETAINED_R16_SINGLE_LF'
+              else:
+                  data=base; mode='CANONICAL_BASE_ALIAS'
+              if len(data)!=row['file_size_bytes'] or hashlib.sha256(data).hexdigest()!=row['sha256_raw_file_bytes']: raise SystemExit(f"materialization mismatch {row['library_id']}")
+              target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(data)
+              materialized.append({'library_id':row['library_id'],'path':row['repository_relative_path'],'mode':mode,'sha256':hashlib.sha256(data).hexdigest(),'size_bytes':len(data)})
+          Path('/tmp/materialized.json').write_text(json.dumps(materialized,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
+          Path('/tmp/private-request-path.txt').write_text(public['private_request_path'],encoding='utf-8')
+          Path('/tmp/group-run-id.txt').write_text(public['group_run_id'],encoding='utf-8')
+          PY
+
+      - name: Build runtime packets
+        run: |
+          set -euo pipefail
+          cd private-authority
+          python scripts/create-group-runtime-packets.py \
+            --request "$(cat /tmp/private-request-path.txt)" \
+            --max-per-question 8 \
+            > /tmp/result.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('/tmp/result.json').read_text(encoding='utf-8'))
+          if r.get('status')!='READY_FOR_BLIND_PREDICTION' or r.get('answer_data_available') is not False: raise SystemExit('result')
+          t=json.loads(Path(r['transport_plan_path']).read_text(encoding='utf-8'))
+          if t.get('status')!='READY' or t.get('answer_data_available') is not False: raise SystemExit('transport')
+          print(json.dumps({'status':r['status'],'group_run_id':r['group_run_id'],'case_count':r['case_count'],'generated_path_count':r['generated_path_count'],'source_packet_item_counts':r['source_packet_item_counts']},sort_keys=True))
+          PY
+
+      - name: Commit and push private audit branch
+        id: push
+        run: |
+          set -euo pipefail
+          cd private-authority
+          group_run_id="$(cat /tmp/group-run-id.txt)"
+          branch="public-executor/${group_run_id}-${GITHUB_RUN_ID}"
+          output_root="data/group-clean-starts/${group_run_id}"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -f -- "$output_root"
+          while IFS= read -r path; do git add -f -- "$path"; done < <(python - <<'PY'
+          import json
+          from pathlib import Path
+          for row in json.loads(Path('/tmp/materialized.json').read_text(encoding='utf-8')): print(row['path'])
+          PY
+          )
+          mapfile -t staged < <(git diff --cached --name-only)
+          [[ "${#staged[@]}" -gt 0 ]]
+          for path in "${staged[@]}"; do
+            case "$path" in
+              "$output_root"/*|knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE/materialized/S19_运行门禁训练释放反馈审计与校准库.txt) ;;
+              *) echo "out-of-scope: $path" >&2; exit 1 ;;
+            esac
+          done
+          git commit -m "Restore R17 S19 and materialize runtime packets for ${group_run_id}"
+          set +e
+          git push origin "HEAD:refs/heads/${branch}" 2>/tmp/writeback-error.log
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            python - "$status" <<'PY'
+          import json,re,sys
+          from pathlib import Path
+          lines=Path('/tmp/writeback-error.log').read_text(encoding='utf-8',errors='replace').splitlines()[-30:]
+          safe=[re.sub(r'gh[pousr]_[A-Za-z0-9_]+','<REDACTED_TOKEN>',x)[:500] for x in lines]
+          Path('/tmp/writeback-diagnostic.json').write_text(json.dumps({'schema':'PRIVATE-BRANCH-WRITEBACK-DIAGNOSTIC-V1','exit_code':int(sys.argv[1]),'stderr_tail':safe,'contains_answer_data':False},indent=2)+'\n',encoding='utf-8')
+          PY
+            exit "$status"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          printf '{"schema":"PRIVATE-BRANCH-WRITEBACK-RECEIPT-V1","status":"PASS","branch":"%s","group_run_id":"%s","contains_answer_data":false}\n' "$branch" "$group_run_id" > /tmp/writeback-receipt.json
+
+      - name: Upload writeback receipt
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-branch-writeback-receipt-${{ github.run_id }}
+          path: /tmp/writeback-receipt.json
+          retention-days: 1
+
+      - name: Upload sanitized writeback diagnostic
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-branch-writeback-diagnostic-${{ github.run_id }}
+          path: /tmp/writeback-diagnostic.json
+          if-no-files-found: ignore
+          retention-days: 1
