@@ -1,0 +1,81 @@
+name: source-topology-diagnostic
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'requests/*.json'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout private authority repository
+        uses: actions/checkout@v4
+        with:
+          repository: chinaneedM/ziwei-bazi-model
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private-authority
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: true
+
+      - name: Compute content-addressed candidate statuses
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+
+          root = Path('private-authority')
+          manifest_path = root / 'knowledge/releases/KNOWLEDGE-R17/release-manifest.json'
+          manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+          row = next(item for item in manifest['source_files'] if item['library_id'] == 'S19')
+          candidates = [
+              row['repository_relative_path'],
+              f"knowledge/base/{row['canonical_filename']}",
+              f"knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE-V2/materialized/{row['canonical_filename']}",
+              f"knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE/materialized/{row['canonical_filename']}",
+          ]
+          result = {
+              'schema': 'S19-CONTENT-ADDRESS-DIAGNOSTIC-V1',
+              'expected_sha256': row['sha256_raw_file_bytes'],
+              'expected_size_bytes': row['file_size_bytes'],
+              'canonical_filename': row['canonical_filename'],
+              'candidates': [],
+              'contains_source_content': False,
+              'contains_answer_data': False,
+          }
+          for relative in dict.fromkeys(candidates):
+              path = root / relative
+              item = {'path': relative, 'exists': path.is_file()}
+              if path.is_file():
+                  item['size_bytes'] = path.stat().st_size
+                  item['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                  item['exact_match'] = (
+                      item['size_bytes'] == row['file_size_bytes']
+                      and item['sha256'] == row['sha256_raw_file_bytes']
+                  )
+              result['candidates'].append(item)
+          Path('/tmp/s19-content-address-diagnostic.json').write_text(
+              json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+          )
+          print(json.dumps({
+              'candidate_count': len(result['candidates']),
+              'exact_match_count': sum(1 for item in result['candidates'] if item.get('exact_match')),
+          }, sort_keys=True))
+          PY
+
+      - name: Upload content-address diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: s19-content-address-diagnostic-${{ github.run_id }}
+          path: /tmp/s19-content-address-diagnostic.json
+          if-no-files-found: error
+          retention-days: 1
