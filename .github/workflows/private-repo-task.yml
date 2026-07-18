@@ -112,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           python - "$PUBLIC_REQUEST_PATH" <<'PY'
-          import hashlib, json, shutil, sys
+          import hashlib, json, sys
           from pathlib import Path
 
           root = Path('private-authority')
@@ -135,10 +135,7 @@ jobs:
 
               if row['library_id'] == 'S19':
                   overlay = root / 'knowledge/candidates/KNOWLEDGE-R17-PROMPT-CUTOVER-CANDIDATE/S19-R17-control-root-overlay.txt'
-                  if not overlay.is_file():
-                      raise SystemExit('R17 S19 overlay missing')
-                  o = overlay.read_bytes()
-                  b = base.read_bytes()
+                  o, b = overlay.read_bytes(), base.read_bytes()
                   variants = {
                       'OVERLAY_PLUS_BASE': o + b,
                       'OVERLAY_TRIM_LF_PLUS_LF_PLUS_BASE': o.rstrip(b'\n') + b'\n' + b,
@@ -146,16 +143,15 @@ jobs:
                       'SINGLE_LF_BOUNDARY': o.rstrip(b'\r\n') + b'\n' + b.lstrip(b'\r\n'),
                       'DOUBLE_LF_BOUNDARY': o.rstrip(b'\r\n') + b'\n\n' + b.lstrip(b'\r\n'),
                   }
-                  exact = [
-                      (name, data) for name, data in variants.items()
-                      if len(data) == row['file_size_bytes']
-                      and hashlib.sha256(data).hexdigest() == row['sha256_raw_file_bytes']
-                  ]
-                  if len(exact) != 1:
-                      summary = {
-                          name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
-                          for name, data in variants.items()
-                      }
+                  exact_by_digest = {}
+                  names_by_digest = {}
+                  for name, candidate in variants.items():
+                      digest = hashlib.sha256(candidate).hexdigest()
+                      if len(candidate) == row['file_size_bytes'] and digest == row['sha256_raw_file_bytes']:
+                          exact_by_digest[digest] = candidate
+                          names_by_digest.setdefault(digest, []).append(name)
+                  if len(exact_by_digest) != 1:
+                      summary = {name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()} for name, data in variants.items()}
                       Path('/tmp/runtime-packet-diagnostic.json').write_text(json.dumps({
                           'schema': 'R17-S19-COMPOSITE-DIAGNOSTIC-V1',
                           'expected_size': row['file_size_bytes'],
@@ -164,8 +160,9 @@ jobs:
                           'contains_source_content': False,
                           'contains_answer_data': False,
                       }, indent=2) + '\n', encoding='utf-8')
-                      raise SystemExit('no unique exact R17 S19 composite')
-                  mode, data = exact[0]
+                      raise SystemExit('no unique exact R17 S19 byte content')
+                  digest, data = next(iter(exact_by_digest.items()))
+                  mode = '|'.join(sorted(names_by_digest[digest]))
               else:
                   data = base.read_bytes()
                   mode = 'CANONICAL_BASE_ALIAS'
@@ -182,9 +179,7 @@ jobs:
                   'sha256': hashlib.sha256(data).hexdigest(),
               })
 
-          Path('/tmp/source-materializations.json').write_text(
-              json.dumps(materialized, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
-          )
+          Path('/tmp/source-materializations.json').write_text(json.dumps(materialized, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
           print(json.dumps({'materialized_count': len(materialized), 'library_ids': [x['library_id'] for x in materialized]}, sort_keys=True))
           PY
 
@@ -201,8 +196,7 @@ jobs:
           )"
           cd private-authority
           set +e
-          python scripts/create-group-runtime-packets.py --request "$private_request" --max-per-question 8 \
-            > /tmp/runtime-packet-result.json 2> /tmp/runtime-packet-error.log
+          python scripts/create-group-runtime-packets.py --request "$private_request" --max-per-question 8 > /tmp/runtime-packet-result.json 2> /tmp/runtime-packet-error.log
           status=$?
           set -e
           if [[ "$status" -ne 0 ]]; then
