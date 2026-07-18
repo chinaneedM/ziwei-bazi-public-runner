@@ -55,8 +55,7 @@ jobs:
           python - "$request" <<'PY'
           import json, re, sys
           from pathlib import Path
-          path = Path(sys.argv[1])
-          body = json.loads(path.read_text(encoding='utf-8'))
+          body = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
           required = {
               'schema': 'FORTUNE-PUBLIC-EXECUTOR-REQUEST-V1',
               'status': 'REQUESTED',
@@ -67,14 +66,11 @@ jobs:
           for key, expected in required.items():
               if body.get(key) != expected:
                   raise SystemExit(f'invalid {key}')
-          request_path = body.get('private_request_path', '')
-          if not re.fullmatch(r'runtime/runtime-packet-requests/[A-Za-z0-9._-]+\.json', request_path):
+          if not re.fullmatch(r'runtime/runtime-packet-requests/[A-Za-z0-9._-]+\.json', body.get('private_request_path', '')):
               raise SystemExit('invalid private_request_path')
-          group_run_id = body.get('group_run_id', '')
-          if not re.fullmatch(r'GROUP-RUN-[A-Za-z0-9._-]+', group_run_id):
+          if not re.fullmatch(r'GROUP-RUN-[A-Za-z0-9._-]+', body.get('group_run_id', '')):
               raise SystemExit('invalid group_run_id')
-          expected_sha = body.get('private_request_sha256', '')
-          if not re.fullmatch(r'[0-9a-f]{64}', expected_sha):
+          if not re.fullmatch(r'[0-9a-f]{64}', body.get('private_request_sha256', '')):
               raise SystemExit('invalid private_request_sha256')
           print('request validation PASS')
           PY
@@ -116,8 +112,7 @@ jobs:
           private_path = Path('private-authority') / public['private_request_path']
           if not private_path.is_file():
               raise SystemExit('private request missing')
-          digest = hashlib.sha256(private_path.read_bytes()).hexdigest()
-          if digest != public['private_request_sha256']:
+          if hashlib.sha256(private_path.read_bytes()).hexdigest() != public['private_request_sha256']:
               raise SystemExit('private request hash mismatch')
           private = json.loads(private_path.read_text(encoding='utf-8'))
           if private.get('group_run_id') != public['group_run_id']:
@@ -141,10 +136,34 @@ jobs:
           PY
           )"
           cd private-authority
+          set +e
           python scripts/create-group-runtime-packets.py \
             --request "$private_request" \
             --max-per-question 8 \
-            > /tmp/runtime-packet-result.json
+            > /tmp/runtime-packet-result.json \
+            2> /tmp/runtime-packet-error.log
+          build_status=$?
+          set -e
+          if [[ "$build_status" -ne 0 ]]; then
+            python - "$build_status" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          lines = Path('/tmp/runtime-packet-error.log').read_text(encoding='utf-8', errors='replace').splitlines()[-30:]
+          safe = []
+          for line in lines:
+              line = re.sub(r'/home/runner/[^ ]+', '<RUNNER_PATH>', line)
+              line = re.sub(r'gh[pousr]_[A-Za-z0-9_]+', '<REDACTED_TOKEN>', line)
+              safe.append(line[:500])
+          Path('/tmp/runtime-packet-diagnostic.json').write_text(json.dumps({
+              'schema': 'PUBLIC-RUNNER-SANITIZED-DIAGNOSTIC-V1',
+              'exit_code': int(sys.argv[1]),
+              'stderr_tail': safe,
+              'contains_case_stdout': False,
+              'contains_answer_data': False,
+          }, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+            exit "$build_status"
+          fi
           python - <<'PY'
           import json
           from pathlib import Path
@@ -166,7 +185,17 @@ jobs:
           }, ensure_ascii=False, sort_keys=True))
           PY
 
+      - name: Upload sanitized build diagnostic
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitized-runtime-packet-diagnostic-${{ github.run_id }}
+          path: /tmp/runtime-packet-diagnostic.json
+          if-no-files-found: ignore
+          retention-days: 1
+
       - name: Commit only bound private output root
+        if: success()
         shell: bash
         env:
           PUBLIC_REQUEST_PATH: ${{ steps.request.outputs.request_path }}
