@@ -96,6 +96,7 @@ jobs:
           path: private-authority
           fetch-depth: 1
           persist-credentials: true
+          lfs: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
