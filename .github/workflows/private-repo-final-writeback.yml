@@ -64,7 +64,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Reconstruct and build verified objects
+      - name: Reconstruct and build verified staged objects
         env:
           REQUEST_PATH: ${{ steps.request.outputs.path }}
         run: |
@@ -94,15 +94,18 @@ jobs:
           Path('/tmp/group-run.txt').write_text(pub['group_run_id'])
           PY
           cd private-authority
-          python scripts/create-group-runtime-packets.py --request "$(cat /tmp/private-request.txt)" --max-per-question 8 >/tmp/build-result.json
+          PYTHONPATH=src python -m unittest tests.test_staged_access -v
+          PYTHONPATH=src python scripts/create-staged-group-runtime-packets.py --request "$(cat /tmp/private-request.txt)" --max-per-question 8 >/tmp/build-result.json
           python - <<'PY'
           import json
           from pathlib import Path
           r=json.loads(Path('/tmp/build-result.json').read_text())
-          if r.get('status')!='READY_FOR_BLIND_PREDICTION' or r.get('answer_data_available') is not False: raise SystemExit('result')
+          if r.get('status')!='READY_FOR_PREBLIND_MODELING' or r.get('answer_data_available') is not False: raise SystemExit('result')
+          if r.get('option_visibility')!='WITHHELD': raise SystemExit('option visibility')
           t=json.loads(Path(r['transport_plan_path']).read_text())
-          if t.get('status')!='READY' or t.get('answer_data_available') is not False: raise SystemExit('transport')
-          print(json.dumps({'status':r['status'],'group_run_id':r['group_run_id'],'case_count':r['case_count'],'generated_path_count':r['generated_path_count'],'source_packet_item_counts':r['source_packet_item_counts']},sort_keys=True))
+          if t.get('status')!='READY_FOR_PREBLIND_MODELING' or t.get('answer_data_available') is not False: raise SystemExit('transport')
+          if t.get('current_stage')!='PREBLIND' or t.get('postblind_release_receipt_required') is not True: raise SystemExit('stage gate')
+          print(json.dumps({'status':r['status'],'group_run_id':r['group_run_id'],'case_count':r['case_count'],'generated_path_count':r['generated_path_count'],'withheld_path_count':r['withheld_path_count'],'preblind_source_packet_item_counts':r['preblind_source_packet_item_counts']},sort_keys=True))
           PY
 
       - name: Commit and push unicode-safe private audit branch
@@ -134,7 +137,7 @@ jobs:
               raise SystemExit('out-of-scope: '+path)
           print('validated staged files:',len(paths))
           PY
-          git commit -m "Restore R17 S19 and materialize runtime packets for ${group_run}"
+          git commit -m "Restore R17 S19 and materialize staged runtime packets for ${group_run}"
           set +e
           git push origin "HEAD:refs/heads/${branch}" 2>/tmp/push-error.log
           status=$?
@@ -150,7 +153,7 @@ jobs:
             exit "$status"
           fi
           commit="$(git rev-parse HEAD)"
-          printf '{"schema":"FINAL-WRITEBACK-RECEIPT-V1","status":"PASS","branch":"%s","commit_sha":"%s","group_run_id":"%s","contains_answer_data":false}\n' "$branch" "$commit" "$group_run" > /tmp/final-writeback-receipt.json
+          printf '{"schema":"FINAL-WRITEBACK-RECEIPT-V1","status":"PASS","stage":"PREBLIND","branch":"%s","commit_sha":"%s","group_run_id":"%s","contains_answer_data":false}\n' "$branch" "$commit" "$group_run" > /tmp/final-writeback-receipt.json
 
       - uses: actions/upload-artifact@v4
         if: success()
