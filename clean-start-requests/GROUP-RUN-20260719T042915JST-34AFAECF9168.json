@@ -1,0 +1,10 @@
+{
+  "answer_data_available": false,
+  "group_run_id": "GROUP-RUN-20260719T042915JST-34AFAECF9168",
+  "private_repository": "chinaneedM/ziwei-bazi-model",
+  "private_request_path": "runtime/clean-start-requests/GROUP-RUN-20260719T042915JST-34AFAECF9168.json",
+  "private_request_sha256": "c6dc14ac9bd3e47fcf3818f27b203e321509333d810f915ace89f9ef27504bc7",
+  "schema": "FORTUNE-PUBLIC-CLEAN-START-REQUEST-V1",
+  "status": "REQUESTED",
+  "task": "CREATE_CLEAN_START"
+}
